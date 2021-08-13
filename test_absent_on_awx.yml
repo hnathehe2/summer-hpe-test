@@ -20,7 +20,7 @@
           dest: "{{store_directory}}/{{item.filepath}}"
           content: "{{item.filecontent}}"
         with_items:
-          - {filepath: 'ca.cer', filecontent: '{{ca_cer}}'}
+          - {filepath: 'ca.cer', filecontent: 'testing value cho vui nek'}
       - name: delete the directory
         file:
           path: '{{store_directory}}'
