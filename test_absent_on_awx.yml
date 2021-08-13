@@ -5,6 +5,12 @@
   tasks:
     - name: running snaplogic flow
       block:
+      - name: test whoami
+        shell: whoami
+        register: whoami_return
+      - name: debug
+        debug:
+          msg: "{{whoami_return}}"
       - name: create directory for testing
         file:
           path: '{{store_directory}}'
