@@ -1,6 +1,6 @@
 ---
 - name: test_absent_on_awx
-  hosts: personal_laptop
+  hosts: 192.168.1.64
   become: yes
   tasks:
     - name: running snaplogic flow
