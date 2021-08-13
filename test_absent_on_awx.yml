@@ -3,8 +3,8 @@
   hosts: personal_laptop
   become: yes
   tasks:
-  name: running snaplogic flow
-    block:
+    - name: running snaplogic flow
+      block:
       - name: create directory for testing
         file:
           path: '{{store_directory}}'
@@ -20,4 +20,4 @@
           path: '{{store_directory}}'
           state: absent
         when: delete_file
-    delegate_to: localhost
+      delegate_to: localhost
