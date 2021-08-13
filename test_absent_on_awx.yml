@@ -1,0 +1,23 @@
+---
+- name: test_absent_on_awx
+  hosts: personal_laptop
+  become: yes
+  tasks:
+  name: running snaplogic flow
+    block:
+      - name: create directory for testing
+        file:
+          path: '{{store_directory}}'
+          state: directory
+      - name: create file by copy
+        copy:
+          dest: "{{store_directory}}/{{item.filepath}}"
+          content: "{{item.filecontent}}"
+        with_items:
+          - {filepath: 'ca.cer', filecontent: '{{ca_cer}}'}
+      - name: delete the directory
+        file:
+          path: '{{store_directory}}'
+          state: absent
+        when: delete_file
+    delegate_to: localhost
