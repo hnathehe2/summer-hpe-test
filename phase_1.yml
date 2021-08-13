@@ -1,0 +1,78 @@
+---
+- name: phase_1 of automation
+  hosts: target_server
+  become: yes
+  ignore_unreachable: yes
+  tasks:
+    - name:
+      become: yes
+      block:
+        - name: create files locally
+          ansible.builtin.file:
+            path: '{{local_store_directory}}'
+            state: directory
+        
+        - name: set up connection to vault
+          block:
+            - name: set up vault address
+              shell: "VAULT_ADDR=https://vault.docker.hpecorp.net:443"
+            - name: log in to vault
+              shell: "vault login -method=github token={{vault_token}}"
+
+        - name: create required file locally for snaplogic and upload to vault
+          block:
+            - name: create new key file locally ca.key
+              shell: "openssl genrsa -out ca.key 2048"
+              args:
+                chdir: '{{local_store_directory}}/'
+            
+            - name: create the ca.csr
+              shell: "openssl req -new -key ca.key -out ca.csr -subj '/C=US/ST=California/L=Palo Alto/O=Hewlett Packard Enterprise Company/OU=Servers/CN={{common_name}}'"
+              args:
+                chdir: '{{local_store_directory}}/'
+            
+            - name: push to vault
+              shell: "vault kv put {{vault_directory}} ca.key=@{{local_store_directory}}/ca.key ca.csr=@{{local_store_directory}}/ca.csr ca.cer='place holder'"
+            
+            - name: write content csr files
+              debug:
+                msg: "{{lookup('file', '{{local_store_directory}}/ca.csr')}}"
+          
+          when: server_type == 'snaplogic'
+
+        - name: create required file locally for kafka and upload to vault
+          block:
+            - name: create new keystore file kafka.itg.keystore.jks
+              shell: "sudo keytool -keystore kafka.itg.keystore.jks -genkey -v -alias {{alias_name}}  -keyalg RSA -keysize 2048 -validity 365 -dname 'CN={{common_name}},OU=Servers,O=Hewlett Packard Enterprise Company,C=US,S=California,L=Palo Alto' -storepass {{storekey_pass}}"
+              args:
+                chdir: '{{local_store_directory}}/'
+            
+            - name: create new csr file (extract from keystore file) kafka-itg.its.hpecorp.net.csr
+              shell: "sudo keytool -keystore kafka.itg.keystore.jks -certreq -alias {{alias_name}} -file kafka-itg.its.hpecorp.net.csr -storepass {{storekey_pass}}"
+              args:
+                chdir: '{{local_store_directory}}/'
+            
+            - name: convert jks to base64 to store in vault
+              shell: "cat kafka.itg.keystore.jks | base64 > kafka.itg.keystore.jks_base64"
+              args:
+                chdir: '{{local_store_directory}}/'
+            
+            - name: push to vault
+              shell: "vault kv put {{vault_directory}} kafka.itg.keystore.jks_base64=@{{local_store_directory}}/kafka.itg.keystore.jks_base64 kafka-itg.its.hpecorp.net.csr=@{{local_store_directory}}/kafka-itg.its.hpecorp.net.csr storekey.pass={{storekey_pass}} kafka-itg.its.hpecorp.net.pem='place holder' "
+              ignore_errors: yes
+            
+            - name: write content csr files
+              debug:
+                msg: "{{lookup('file', '{{local_store_directory}}/kafka-itg.its.hpecorp.net.csr')}}"
+          
+          when: server_type == 'kafka'
+        
+        - name: remove all file locally after finishing
+          file:
+            path: '{{local_store_directory}}'
+            state: absent
+          when: delete_local_file == True
+      
+      delegate_to: localhost
+
+

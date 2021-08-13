@@ -1,0 +1,210 @@
+---
+- name: phase_2 of automation
+  hosts: target_server
+  become: yes
+  vars:
+    keytool_exist: True
+    cert_content: "place holder"
+    cert_shorten_content: "place holder"
+  tasks:
+    - name: check keytool for snaplogic
+      block:
+        - name: try keytool command in host terminal
+          shell: "keytool"
+          register: keytool_return
+          ignore_errors: yes
+
+        - name: check keytool exist from return value
+          set_fact:
+            keytool_exist: False
+          when: keytool_return.stderr.find('not found') != -1
+        
+        - name: add keytool if keytool is not added
+          block:
+            - name: install locate 
+              ansible.builtin.package:
+                name: mlocate
+                state: present 
+        
+            - name: update locate data
+              shell: "sudo updatedb"
+        
+            - name: locate keytool location
+              shell: "locate /opt/snaplogic/pkgs/jdk*/bin/keytool | head -n 1 | xargs dirname"
+              register: java_bin_path
+        
+            - name: update $PATH to include java bin
+              shell: "PATH=$PATH:~{{java_bin_path}}"
+         
+          when: keytool_exist == False          
+
+        - name: getting ca.key ca.cer HP_Ent_Private_SSL_CA.cer HPE_PrivateRootCA.cer from Vault
+          set_fact:
+            ca_cer: "{{ lookup('hashi_vault', '{{vault_directory}}:ca.cer github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            ca_key: "{{ lookup('hashi_vault', '{{vault_directory}}:ca.key github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            HP_Ent_Private_SSL_CA_cer:  "{{ lookup('hashi_vault', '{{HPE_Private_Root_vault}}:HP_Ent_Private_SSL_CA.cer github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            HPE_PrivateRootCA_cer:  "{{ lookup('hashi_vault', '{{HPE_Private_Root_vault}}:HPE_PrivateRootCA.cer github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+        
+        - name: create directory for storing files
+          ansible.builtin.file:
+            path: '{{store_directory}}'
+            state: directory
+        
+        - name: create file from Vault content
+          copy:
+            dest: '{{store_directory}}/{{item.filepath}}'
+            content: '{{item.filecontent}}'
+          with_items:
+            - {filepath: 'ca.cer', filecontent: '{{ca_cer}}'} 
+            - {filepath: 'ca.key', filecontent: '{{ca_key}}'}
+            - {filepath: 'HP_Ent_Private_SSL_CA.cer', filecontent: '{{HP_Ent_Private_SSL_CA_cer}}'}
+            - {filepath: 'HPE_PrivateRootCA.cer', filecontent: '{{HPE_PrivateRootCA_cer}}'}
+          no_log: True #not writting the content to screen
+        
+        - name: cat 3 .cer files into .pem
+          shell: "cat ca.cer HP_Ent_Private_SSL_CA.cer HPE_PrivateRootCA.cer > sl-ca-chain.pem"
+          args:
+            chdir: '{{store_directory}}/'
+
+        - name: generate a key with no pass
+          shell: "openssl rsa -in ca.key -out key_no_pass.pem"
+          args:
+            chdir: '{{store_directory}}/'
+      
+        - name: generate PKCS12 file
+          shell: "openssl pkcs12 -inkey key_no_pass.pem -in sl-ca-chain.pem -export -out sl-ca-chain.p12 -name {{alias_name}} -passout pass:$(cat {{storekey_pass_path}})"
+          args:
+            chdir: '{{store_directory}}'
+
+        - name: put server into maintenance mode and update
+          block:
+            - name: put server into maintenance mode
+              shell: |
+                /opt/snaplogic/bin/jcc.sh maintenance=true
+                while [[ "$(curl -ks https://"$SNAPLOGIC_HOST":"$SNAPLOGIC_PORT"/healthz)" != "MAINTENANCE" ]]; do echo "Waiting for maintenance mode"; sleep 5; done
+                /opt/snaplogic/bin/jcc.sh stop
+
+            - name: copy old certificate
+              shell: "sudo cp {{old_certificate_path}} {{store_directory}}/old_Certificate.jks"
+              
+            - name: using keytool command to create final jks
+              shell: "keytool -importkeystore -srckeystore sl-ca-chain.p12 -srcstoretype PKCS12 -destkeystore {{old_certificate_path}} -deststoretype JCEKS -deststorepass $(cat {{storekey_pass_path}}) -srcstorepass $(cat {{storekey_pass_path}}) -noprompt"
+              args:
+                chdir: '{{store_directory}}/'
+
+            - name: update trustcacert
+              shell: "keytool -import -trustcacerts -alias hewlettpackardenterpriseca -file HPE_PrivateRootCA.cer -keystore {{old_trustca_path}} -deststorepass changeit -noprompt"
+              args:
+                chdir: '{{store_directory}}/'
+
+            - name: get server out of maintenance mode
+              shell: |
+                /opt/snaplogic/bin/jcc.sh start
+                /opt/snaplogic/bin/jcc.sh maintenance=false
+                while [[ $(curl -fs https://"$SNAPLOGIC_HOST":"$SNAPLOGIC_PORT"/healthz) != "OK" ]]; do echo "Waiting for JCC startup"; sleep 5; done
+          when: production
+
+        - name: get certificate content
+          shell: "openssl pkcs12 -in sl-ca-chain.p12 -nodes -passin pass:$(cat {{storekey_pass_path}}) | openssl x509 -noout -text"
+          args:
+            chdir: '{{store_directory}}/'
+          register: cert_content
+        
+        - name: get certificate shorten content
+          shell: "openssl pkcs12 -in sl-ca-chain.p12 -nodes -passin pass:$(cat {{storekey_pass_path}}) | openssl x509 -noout -subject -dates -email"
+          args:
+            chdir: '{{store_directory}}/'
+          register: cert_shorten_content
+
+        - name: write out certificate content
+          block:
+            - name: full certificate
+              debug:
+                msg: "{{cert_content.stdout_lines}}"
+            
+            - name: important information
+              debug:
+                msg: "{{cert_shorten_content.stdout_lines}}"
+      
+      when: server_type == 'snaplogic'
+    
+    - name: run kafka workflow
+      block:
+        - name: getting kafka.itg.keystore.jks kafka-itg.its.hpecorp.net.pem HP_Ent_Private_SSL_CA.cer HPE_PrivateRootCA.cer
+          set_fact:
+            kafka_itg_keystore_jks_base64: "{{ lookup('hashi_vault', '{{vault_directory}}:kafka.itg.keystore.jks_base64 github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            kafka_itg_its_hpecorp_net_pem: "{{ lookup('hashi_vault', '{{vault_directory}}:kafka-itg.its.hpecorp.net.pem github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            HP_Ent_Private_SSL_CA_cer:  "{{ lookup('hashi_vault', '{{HPE_Private_Root_vault}}:HP_Ent_Private_SSL_CA.cer github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            HPE_PrivateRootCA_cer:  "{{ lookup('hashi_vault', '{{HPE_Private_Root_vault}}:HPE_PrivateRootCA.cer github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+            storekey_pass: "{{lookup('hashi_vault', '{{vault_directory}}:storekey.pass github={{vault_token}} url=https://vault.docker.hpecorp.net:443')}}"
+        
+        - name: create directory for storing
+          ansible.builtin.file:
+            path: '{{store_directory}}'
+            state: directory
+
+        - name: create file by copy
+          copy:
+            dest: '{{store_directory}}/{{item.filepath}}'
+            content: '{{item.filecontent}}'
+          with_items:
+            - {filepath: 'kafka.itg.keystore.jks_base64', filecontent: '{{kafka_itg_keystore_jks_base64}}'} 
+            - {filepath: 'kafka-itg.its.hpecorp.net.pem', filecontent: '{{kafka_itg_its_hpecorp_net_pem}}'}
+            - {filepath: 'HP_Ent_Private_SSL_CA.cer', filecontent: '{{HP_Ent_Private_SSL_CA_cer}}'}
+            - {filepath: 'HPE_PrivateRootCA.cer', filecontent: '{{HPE_PrivateRootCA_cer}}'}
+          no_log: True
+        
+        - name: convert base64 file to jks
+          shell: "cat kafka.itg.keystore.jks_base64 | base64 --decode > kafka.itg.keystore.jks"
+          args:
+            chdir: "{{store_directory}}"
+        
+        - name: import HPE Root certificate
+          shell: "keytool  -keystore kafka.itg.keystore.jks -import -v -trustcacerts -file HPE_PrivateRootCA.cer -alias hpeca -storepass {{storekey_pass}} -noprompt"
+          args: 
+            chdir: "{{store_directory}}"
+        
+        - name: import HPE Chain certificate
+          shell: "keytool  -keystore kafka.itg.keystore.jks -import -v -trustcacerts -file HP_Ent_Private_SSL_CA.cer -alias hpe_ssl_int_ca -storepass {{storekey_pass}} -noprompt"
+          args: 
+            chdir: "{{store_directory}}"
+        
+        - name: import signed certificate
+          shell: "keytool  -keystore kafka.itg.keystore.jks -import -v -trustcacerts -file kafka-itg.its.hpecorp.net.pem -storepass {{storekey_pass}} -alias kafka-client -noprompt"
+          args: 
+            chdir: '{{store_directory}}'
+        
+        - name: replace old certificate
+          block:
+            - name: copy old certificate to current directory
+              shell: sudo cp {{old_certificate_path}} {{store_directory}}/old_certificate.jks
+            - name: replace old certificate with new certificate
+              shell: sudo cp {{store_directory}}/kafka.itg.keystore.jks {{old_certificate_path}}
+
+        - name: get certificate content
+          shell: "keytool -v -list -keystore kafka.itg.keystore.jks -storepass {{storekey_pass}}"
+          register: cert_content
+          args:
+            chdir: '{{store_directory}}' 
+        
+        - name: get alias
+          shell: "keytool -v -list -keystore kafka.itg.keystore.jks -storepass {{storekey_pass}} | grep Alias"
+          register: cert_shorten_content
+          args:
+            chdir: '{{store_directory}}'
+        
+        - name: restart Kafka server
+          shell: "sudo systemctl restart confluent-kafka"
+          when: restart_server
+      
+        - name: write out certificate content
+          block:
+            - name: full certificate
+              debug:
+                msg: "{{cert_content.stdout_lines}}"
+            
+            - name: important information
+              debug:
+                msg: "{{cert_shorten_content.stdout_lines}}"
+      when: server_type == 'kafka'
+  
